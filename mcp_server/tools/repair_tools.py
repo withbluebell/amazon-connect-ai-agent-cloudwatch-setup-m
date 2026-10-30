@@ -9,6 +9,43 @@ from util import call_iservice
 
 log = logging.getLogger("mcp_server")
 
+# Identity fields that MUST be present in the session before any repair
+# operation can call the downstream iService API. These are written ONLY by
+# setCustomerByPhoneAndName; if any is missing the customer has not completed
+# identity verification and the request must be rejected rather than sent
+# downstream with null values (which produces orphaned/dirty records).
+_REQUIRED_IDENTITY_FIELDS = ("bu", "countryCode", "phoneNumber", "customerName")
+
+
+def _get_verified_session(session_client, contactId):
+    """Load the session and enforce that identity verification is complete.
+
+    Returns:
+        (session, error_response)
+        - On success: (session_dict, None)
+        - On failure: (None, json_error_string) where the error string is a
+          ready-to-return tool result with status "failed".
+
+    Failure cases:
+        - Session does not exist              -> message "customer_not_found"
+        - Session exists but identity missing -> message "customer_not_verified"
+    """
+    session = session_client.get(contactId)
+    if not session:
+        return None, json.dumps({"status": "failed", "message": "customer_not_found"})
+
+    missing = [f for f in _REQUIRED_IDENTITY_FIELDS if not session.get(f)]
+    if missing:
+        log.info(
+            f"identity verification incomplete: contactId='{contactId}', "
+            f"missing={missing}"
+        )
+        return None, json.dumps(
+            {"status": "failed", "message": "customer_not_verified"}
+        )
+
+    return session, None
+
 
 def register_repair_tools(mcp, session_client):
     """Register repair service tools to the MCP server.
@@ -56,10 +93,27 @@ def register_repair_tools(mcp, session_client):
         If the customer is only asking questions or gathering information, respond to their questions (e.g., via FAQ search, order status queries) without initiating createRepair.
 
         ═══════════════════════════════════════════════════════════════════════════════════
-        PREREQUISITE
+        PREREQUISITE (MANDATORY IDENTITY GATE)
         ═══════════════════════════════════════════════════════════════════════════════════
 
-        Call checkCustomer BEFORE collecting any fields from the customer.
+        A verified customer identity is REQUIRED before this tool will do anything.
+        Identity is verified ONLY after setCustomerByPhoneAndName has completed
+        successfully in this session.
+
+        You MUST, in this exact order, BEFORE collecting any repair fields:
+        1. Call checkCustomer.
+        2. If checkCustomer returns "customer_not_found", complete the
+           setCustomerByPhoneAndName verification flow and do NOT proceed until it
+           returns "success".
+        3. Only then begin field collection and ultimately call createRepair.
+
+        Never skip step 2. If the conversation was interrupted (e.g. the customer
+        changed topic or barged in) and you are unsure whether verification
+        completed, call checkCustomer again and re-verify rather than assuming.
+
+        This is enforced server-side: if identity is not verified, createRepair
+        returns status "failed" with message "customer_not_verified" and performs
+        no action. Supplying field values directly does NOT satisfy the gate.
 
         ═══════════════════════════════════════════════════════════════════════════════════
         FIELD COLLECTION FLOW
@@ -173,15 +227,15 @@ def register_repair_tools(mcp, session_client):
         Returns:
             JSON string with one of the following statuses:
             - "success": Repair request created successfully, includes srNumber (the service request number assigned to this order)
-            - "failed": Creation failed, includes reason for failure
+            - "failed": Creation failed, includes reason for failure. In particular, message "customer_not_verified" means the mandatory identity gate was not satisfied — go back and complete checkCustomer + setCustomerByPhoneAndName, then retry.
 
         POST-CALL: After a SUCCESSFUL tool call, append the questionFinish placeholder ({{$.Custom.questionFinish}}) at the end of your customer-facing message, separated by one blank line. Do NOT append it if the call failed or returned an error. Appending the questionFinish placeholder counts as your single question for that turn.
         """
         log.info(f"createRepair: contactId='{contactId}'")
 
-        session = session_client.get(contactId)
-        if not session:
-            return json.dumps({"status": "failed", "message": "customer_not_found"})
+        session, err = _get_verified_session(session_client, contactId)
+        if err:
+            return err
 
         productCategory = productCategory.strip() if productCategory else ""
         productModel = productModel.strip() if productModel else ""
@@ -249,7 +303,13 @@ def register_repair_tools(mcp, session_client):
         WHEN TO CALL: ONLY call this tool when the customer explicitly requests to QUERY or VIEW their repair/service order list.
         Trigger phrases include: "show my repairs", "list my service requests", "what repairs do I have", "check my orders", etc.
 
-        IMPORTANT: Call checkCustomer BEFORE asking the customer anything.
+        MANDATORY IDENTITY GATE: This tool requires a verified customer identity.
+        Call checkCustomer FIRST (before asking the customer anything). If it
+        returns "customer_not_found", complete setCustomerByPhoneAndName until it
+        returns "success" before calling this tool. If identity is not verified,
+        this tool returns status "failed" with message "customer_not_verified" and
+        performs no action (enforced server-side). If a prior interruption leaves
+        verification status uncertain, re-run checkCustomer rather than assuming.
 
         ═══════════════════════════════════════════════════════════════════════════════════
         FIELD COLLECTION FLOW
@@ -277,15 +337,15 @@ def register_repair_tools(mcp, session_client):
         Returns:
             JSON string with one of the following statuses:
             - "success": Successfully retrieved repair list, includes repairs array
-            - "failed": Query failed, includes reason for failure
+            - "failed": Query failed, includes reason for failure. Message "customer_not_verified" means the identity gate was not satisfied — complete checkCustomer + setCustomerByPhoneAndName, then retry.
 
         POST-CALL: After a SUCCESSFUL tool call, append the questionFinish placeholder ({{$.Custom.questionFinish}}) at the end of your customer-facing message, separated by one blank line. Do NOT append it if the call failed or returned an error. Appending the questionFinish placeholder counts as your single question for that turn.
         """
         log.info(f"listRepairs: contactId='{contactId}'")
 
-        session = session_client.get(contactId)
-        if not session:
-            return json.dumps({"status": "failed", "message": "customer_not_found"})
+        session, err = _get_verified_session(session_client, contactId)
+        if err:
+            return err
 
         api_result = await call_iservice(
             "/api/iservice-ccm/bot/api/serviceReques/list",
@@ -328,7 +388,13 @@ def register_repair_tools(mcp, session_client):
         WHEN TO CALL: ONLY call this tool when the customer explicitly requests to CANCEL a specific repair/service order.
         Trigger phrases include: "cancel my repair", "cancel service request", "I want to cancel order", etc.
 
-        IMPORTANT: Call checkCustomer BEFORE asking the customer anything.
+        MANDATORY IDENTITY GATE: This tool requires a verified customer identity.
+        Call checkCustomer FIRST (before asking the customer anything). If it
+        returns "customer_not_found", complete setCustomerByPhoneAndName until it
+        returns "success" before calling this tool. If identity is not verified,
+        this tool returns status "failed" with message "customer_not_verified" and
+        performs no action (enforced server-side). If a prior interruption leaves
+        verification status uncertain, re-run checkCustomer rather than assuming.
 
         ═══════════════════════════════════════════════════════════════════════════════════
         FIELD COLLECTION FLOW
@@ -373,7 +439,7 @@ def register_repair_tools(mcp, session_client):
         Returns:
             JSON string with one of the following statuses:
             - "success": Repair cancelled successfully
-            - "failed": Cancellation failed, includes reason for failure
+            - "failed": Cancellation failed, includes reason for failure. Message "customer_not_verified" means the identity gate was not satisfied — complete checkCustomer + setCustomerByPhoneAndName, then retry.
 
         POST-CALL: After a SUCCESSFUL tool call, append the questionFinish placeholder ({{$.Custom.questionFinish}}) at the end of your customer-facing message, separated by one blank line. Do NOT append it if the call failed or returned an error. Appending the questionFinish placeholder counts as your single question for that turn.
         """
@@ -381,9 +447,9 @@ def register_repair_tools(mcp, session_client):
             f"cancelRepair: contactId='{contactId}', srNumber='{srNumber}', cancelReason='{cancelReason}'"
         )
 
-        session = session_client.get(contactId)
-        if not session:
-            return json.dumps({"status": "failed", "message": "customer_not_found"})
+        session, err = _get_verified_session(session_client, contactId)
+        if err:
+            return err
 
         srNumber = srNumber.strip()
         cancelReason = cancelReason.strip()
@@ -422,7 +488,13 @@ def register_repair_tools(mcp, session_client):
         WHEN TO CALL: ONLY call this tool when the customer explicitly requests to VIEW or CHECK the details of a specific repair/service order.
         Trigger phrases include: "show details of my repair", "check status of SR number", "what is the detail of my service request", etc.
 
-        IMPORTANT: Call checkCustomer BEFORE asking the customer anything.
+        MANDATORY IDENTITY GATE: This tool requires a verified customer identity.
+        Call checkCustomer FIRST (before asking the customer anything). If it
+        returns "customer_not_found", complete setCustomerByPhoneAndName until it
+        returns "success" before calling this tool. If identity is not verified,
+        this tool returns status "failed" with message "customer_not_verified" and
+        performs no action (enforced server-side). If a prior interruption leaves
+        verification status uncertain, re-run checkCustomer rather than assuming.
 
         ═══════════════════════════════════════════════════════════════════════════════════
         FIELD COLLECTION FLOW
@@ -454,15 +526,15 @@ def register_repair_tools(mcp, session_client):
         Returns:
             JSON string with one of the following statuses:
             - "success": Successfully retrieved repair details, includes full repair information
-            - "failed": Query failed, includes reason for failure
+            - "failed": Query failed, includes reason for failure. Message "customer_not_verified" means the identity gate was not satisfied — complete checkCustomer + setCustomerByPhoneAndName, then retry.
 
         POST-CALL: After a SUCCESSFUL tool call, append the questionFinish placeholder ({{$.Custom.questionFinish}}) at the end of your customer-facing message, separated by one blank line. Do NOT append it if the call failed or returned an error. Appending the questionFinish placeholder counts as your single question for that turn.
         """
         log.info(f"getRepairDetail: contactId='{contactId}', srNumber='{srNumber}'")
 
-        session = session_client.get(contactId)
-        if not session:
-            return json.dumps({"status": "failed", "message": "customer_not_found"})
+        session, err = _get_verified_session(session_client, contactId)
+        if err:
+            return err
 
         srNumber = srNumber.strip()
 
