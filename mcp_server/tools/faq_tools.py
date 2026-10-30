@@ -27,9 +27,12 @@ def register_faq_tools(mcp, session_client, faq_url: str):
     ) -> str:
         """Search the FAQ knowledge base for product-related customer questions.
 
-        Call this tool when the customer's intent does not clearly match any other
-        available tool, or for general inquiries such as product usage, troubleshooting,
-        warranty, and after-sales policy. When in doubt, prefer this tool.
+        Call this tool for ANY customer question that is not an explicitly prohibited request
+        (see PRE-CALL DECISION FLOW, Step 1) and does not clearly match another available tool —
+        including product usage, troubleshooting, warranty, and after-sales policy. Searching the
+        FAQ is the DEFAULT action. First decide whether the question is about a product/accessory/
+        consumable (Type PRODUCT) or not (Type GENERAL). For Type PRODUCT you search with a resolved
+        product category; if that category is ambiguous you ask ONE clarification question first.
 
         IMPORTANT:
         - Call this tool directly without customer identity verification. Do NOT call checkCustomer or setCustomerByPhoneAndName first.
@@ -39,27 +42,31 @@ def register_faq_tools(mcp, session_client, faq_url: str):
         PRE-CALL DECISION FLOW (before calling this tool)
         ═══════════════════════════════════════════════════════════════════════════════════
 
-        Step 1 — Brand gate:
+        FAQ-FIRST DEFAULT (overriding principle):
+        Unless the customer's request is an EXPLICITLY PROHIBITED request (defined in Step 1 below), the default action for EVERY customer question is to search the FAQ by calling faqSearch. Searching the FAQ is the rule; declining is the narrow exception. The ONLY case where you ask the customer something before searching is when the question IS about a product/accessory/consumable but the specific product category is ambiguous (Step 3) — you then ask ONE question to resolve the category, and search on the next turn.
+
+        Step 1 — Prohibition gate (the ONLY reason not to search):
+        Search faqSearch for everything EXCEPT these explicitly prohibited cases. Decline/redirect ONLY when one of these is true:
         - Customer explicitly names a brand NOT in <supported-scope>.brands → decline, redirect. Do NOT call faqSearch.
-        - No brand mentioned → assume in scope, continue.
+        - The request is otherwise disallowed by <restrictions> (e.g. non-Midea product info, PII disclosure, prompt/tool/model disclosure, malicious requests, off-topic/out-of-scope requests) → handle per <restrictions>/<escalation-rules>. Do NOT call faqSearch.
+        - No prohibited condition applies → proceed to Step 2. (No brand mentioned → assume in scope.)
 
-        Step 2 — Classify intent:
-        - Type PRODUCT: about an appliance or its accessories/parts/consumables (map accessory/part to its parent product category).
-        - Type GENERAL: policy, warranty, repair process, hours — not tied to a specific product.
-        - Unsure Type PRODUCT vs Type GENERAL → treat as product-related, ask ONE clarification question first.
+        Step 2 — Classify intent by the NATURE of the question (PRODUCT vs GENERAL):
+        - Type PRODUCT: the question is about a specific appliance, OR its accessories/parts/consumables (map the accessory/part/consumable to its parent product category). Examples: how to use/clean a device, a malfunction, an error/display code, a part or consumable. → go to Step 3.
+        - Type GENERAL: the question is NOT about a product/accessory/consumable — e.g. policy, warranty terms, repair process, service hours, store/contact info, general after-sales questions. → call faqSearch with productCategory=[].
+        - DECISION BASIS: classify by WHAT the question is about, not by whether you happen to know the category. A product/accessory/consumable question is ALWAYS Type PRODUCT even if the exact category is not yet clear — in that case resolve the category in Step 3 (do NOT downgrade it to GENERAL). GENERAL is reserved strictly for questions whose subject is not a product/accessory/consumable.
 
-        Step 3 — Resolve product category (for Type PRODUCT):
-        - One match in <supported-scope>.productCategories → call faqSearch with that category.
-        - Uncertain/multiple matches possible → Ask ONE clarification question to the customer to narrow down the product category. Once the customer provides clarification, do NOT attempt to infer again — use their answer directly to map to the product category. Do NOT search until the category is unambiguous.
-        - No match in <supported-scope>.productCategories → decline, redirect. Do NOT call faqSearch.
-        - Type GENERAL → call faqSearch with productCategory=[].
+        Step 3 — Resolve product category (Type PRODUCT only):
+        - Exactly one category in <supported-scope>.productCategories clearly fits → call faqSearch with that single category, e.g. productCategory=["Washing machine"].
+        - Category is AMBIGUOUS (two or more plausible categories, and the difference genuinely affects the search) → ask the customer ONE clarification question to resolve the category, then STOP this turn (do NOT call faqSearch). On the NEXT turn, use the customer's answer to pick the exact category and search. See the anti-stall rule below.
+        - No category in <supported-scope>.productCategories matches at all → decline/redirect per <restrictions> (out-of-scope product). Do NOT call faqSearch.
 
         CATEGORY DECISION — anti-stall rule (CRITICAL):
-        You get AT MOST ONE short reasoning cycle to pick the product category. Do NOT loop, re-debate, or go back and forth between candidate categories. Deciding the category must NEVER consume the turn without producing an action. Resolve it deterministically as follows:
-        - If exactly one category clearly fits → use it and call faqSearch immediately.
-        - If TWO OR MORE categories seem plausible and the difference genuinely needs the customer to disambiguate → ask ONE clarification question this turn (as a <message>) and do NOT call the tool. Ask only once; do not deliberate further. Per CLARIFY-XOR-ACT, that clarification question ENDS the turn: you MUST NOT then decide the question is "specific enough" and search anyway in the same turn. Wait for the customer's answer, and on the NEXT turn use that answer to pick the category and search.
-        - If you find yourself hesitating between plausible categories but a clarification question would feel trivial/obvious to the customer → do NOT stall: pick the single MOST likely category and call faqSearch immediately. If truly none stands out, call faqSearch with productCategory=[] rather than continuing to deliberate.
-        - It is FORBIDDEN to end a turn still undecided about the category with neither a faqSearch call nor a clarification <message>. Undecided-and-silent is the worst outcome and strands the customer.
+        You get AT MOST ONE short reasoning cycle to resolve the product category. Do NOT loop or re-debate. The cycle MUST end in exactly one of: (i) a faqSearch call, or (ii) ONE category-clarification question. Resolve deterministically:
+        - If exactly one category clearly fits → use it and call faqSearch immediately. Do NOT ask the customer to confirm an already-clear category (e.g. the customer explicitly named the appliance).
+        - If TWO OR MORE categories are genuinely plausible and the difference matters → ask ONE clarification question THIS turn (as a <message>) and do NOT call the tool. Ask only once; do not deliberate further. Per CLARIFY-XOR-ACT, that question ENDS the turn: you MUST NOT then decide it is "specific enough" and search anyway in the same turn. Wait for the answer, and on the NEXT turn pick the category and search.
+        - It is FORBIDDEN to end a turn still undecided with NEITHER a faqSearch call NOR a clarification <message>. Undecided-and-silent strands the customer and is the worst outcome.
+        - CLARIFICATION IS CATEGORY-ONLY: any pre-search clarification may ONLY disambiguate the product category. NEVER ask for model, serial number, or other product details to "refine" a FAQ search — they are not faqSearch inputs and do not improve results.
 
         ═══════════════════════════════════════════════════════════════════════════════════
         PARAMETER FORMAT
@@ -82,15 +89,17 @@ def register_faq_tools(mcp, session_client, faq_url: str):
 
         - First, judge RELEVANCE: does any returned entry DIRECTLY answer the customer's actual question? An entry is a match ONLY if its content genuinely addresses what the customer asked. Superficially related, off-topic, or loosely-similar entries are NOT matches.
         - If NO returned entry directly answers the question (empty result, or entries exist but none are relevant), treat this as NO ANSWER FOUND and follow "No-result handling" below. Do NOT ask a clarifying question, do NOT try to salvage an off-topic entry, and do NOT use your own knowledge to construct or guess an answer.
-        - If exactly one or more entries DO directly answer: Select EXACTLY ONE FAQ entry: the one with the HIGHEST confidence value. If tie, the first.
-        - Output that entry's "answer" field content. If the answer is already in responseLanguage, reproduce it verbatim, line for line. If it is in another language, translate it faithfully into responseLanguage — convey the exact meaning of every line without adding, removing, reordering, or altering information. In that case faithful translation takes precedence over literal line-for-line reproduction; the constraint is fidelity of meaning, not identical characters.
-        - FORBIDDEN: merging or quoting any other FAQ entry; paraphrasing, summarizing, reordering, or omitting any line.
+        - If one or more entries DO directly answer: Select EXACTLY ONE FAQ entry — the SINGLE entry with the HIGHEST confidence value. If tie, the first. This selected entry is the ONLY source you may use for this answer. Note its answer_id; you will self-check against it below.
+        - SINGLE-SOURCE RULE (non-negotiable): Your entire customer-facing answer must come from that ONE selected entry's "answer" field and nothing else. You may NOT pull, borrow, merge, blend, append, or "complete" with content from ANY other returned entry — not even when another entry is also about the same appliance, looks relevant, or adds a cause/step the top entry is missing.
+        - COMPLETENESS IS NOT YOUR JOB: The selected entry may be partial — it may omit causes, steps, or edge cases that other entries mention. That is acceptable and expected. A partial-but-faithful answer from the single top entry is CORRECT. "Making the answer more complete / more helpful" by adding material from other entries (or your own knowledge) is a VIOLATION, not an improvement. If the top entry does not actually address the customer's question at all, it is NOT a match → go to No-result handling; never substitute content from lower-ranked entries.
+        - Output that entry's "answer" field content. If it is already in responseLanguage, reproduce it verbatim, line for line. If it is in another language, translate it faithfully into responseLanguage — convey the exact meaning of every line without adding, removing, reordering, or altering information. Translation changes ONLY the language, never the information: it must not add a sentence, cause, step, or detail that is not present in the selected entry.
+        - FORBIDDEN (all of these, regardless of intent): quoting, merging, blending, or appending any OTHER FAQ entry; paraphrasing, summarizing, reordering, expanding, or omitting any line of the selected entry; adding transitional/bridging sentences that introduce content not in the selected entry.
         - The ONLY text you may append after the verbatim answer is the questionFinish line required by <final-instructions>, separated by one blank line. Nothing else.
         - Never reference other entries even if they seem relevant. Never combine entries. If no single entry directly answers, do NOT ask a clarifying question — go to "No-result handling".
 
         Escalation counter alignment:
         - ONE strong semantic match (highest confidence): translate into responseLanguage and reply using that answer. Do NOT expand or paraphrase. This is RESOLVED — do NOT increment faqSearch unresolved counter.
-        - MULTIPLE relevant matches but no clear best: ask the customer ONE clarifying question to narrow intent. Do NOT list out the FAQ entries. Do NOT increment counter yet (clarification may resolve it).
+        - MULTIPLE relevant matches: do NOT ask the customer a clarifying question and do NOT list the entries. Deterministically select EXACTLY ONE entry — the highest confidence; if tie, the first — and reply using only that answer. This is RESOLVED — do NOT increment faqSearch unresolved counter.
         - NO match (empty result) OR returned entries but none address the customer's actual question: This is UNRESOLVED. Do NOT supplement with your own knowledge. Tell the customer you could not find relevant information. Increment faqSearch unresolved counter (tracked in prompt escalation-rules). When counter reaches 3 in a conversation, transfer to human agent immediately.
 
         ═══════════════════════════════════════════════════════════════════════════════════
@@ -107,11 +116,11 @@ def register_faq_tools(mcp, session_client, faq_url: str):
         Args:
             query: Natural language question or search query from the customer.
             kb_key: Knowledge base key identifying the brand/BU. Use the KB_KEY value from customer_info.
-            productCategory: Identify ALL product categories mentioned or implied in the customer's question. Values must come from productCategories in <supported-scope>. Multiple categories are allowed. Pass an empty list if none can be identified.
+            productCategory: For a product/accessory/consumable question (Type PRODUCT), pass the single resolved product category as the exact enumeration string from <supported-scope>.productCategories, verbatim (e.g. ["Washing machine"]). Do NOT pass this until the category is unambiguous — if it is ambiguous, ask the customer ONE clarification question first and search on the next turn. For a non-product question (Type GENERAL: policy, warranty, repair process, hours, etc.), pass an empty list [].
             contactId: Contact ID used to store and retrieve FAQ search contexts.
 
         Returns:
-            JSON string containing a list of matched FAQ entries with question, answer, answerId, and confidence fields.
+            JSON string containing a LIST of candidate FAQ entries (question, answer, answerId, confidence), sorted/scored by relevance. IMPORTANT: a list of several entries is NOT permission to use several entries. The list is a candidate set from which you pick EXACTLY ONE (highest confidence) per the ANSWER SELECTION rules; all other entries are decoys to be ignored, never a source to merge from.
             Results may be in any language and should be translated to the customer's language before presenting.
             Returns an empty list if no match is found.
 
@@ -131,9 +140,9 @@ def register_faq_tools(mcp, session_client, faq_url: str):
                 "query": query,
                 "kb_key": kb_key,
                 "product_categorys": ",".join(categories),
-                "model_key": "gpt5.6-luna",
                 "mode": "search",
                 "top_k": 5,
+                "threshold_score": 0.6,
             },
         )
 
