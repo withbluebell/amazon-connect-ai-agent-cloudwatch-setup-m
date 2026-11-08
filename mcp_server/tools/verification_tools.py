@@ -6,7 +6,8 @@ This module provides customer identity verification functionality.
 import json
 import logging
 from util import call_iservice
-from .repair_tools import _REQUIRED_IDENTITY_FIELDS
+from . import repair_intake as intake
+from .repair_intake import REQUIRED_IDENTITY_FIELDS as _REQUIRED_IDENTITY_FIELDS
 
 log = logging.getLogger("mcp_server")
 
@@ -33,14 +34,17 @@ def register_verification_tools(mcp, session_client):
             - "customer_found": Customer identity is verified and stored in the session. You may proceed with operations that require customer identity.
             - "customer_not_found": Customer identity is NOT verified.
 
-        MANDATORY GATE (applies to every repair tool: createRepair, listRepairs,
-        cancelRepair, getRepairDetail):
+        MANDATORY GATE (applies to createRepair, listRepairs, cancelRepair,
+        getRepairDetail):
         - These tools REQUIRE a verified customer identity. Identity is considered
           verified ONLY after setCustomerByPhoneAndName has completed successfully
           in this session.
-        - If this tool returns "customer_not_found", you MUST complete the
-          setCustomerByPhoneAndName verification flow BEFORE calling any repair
-          tool. Do NOT call a repair tool while identity is unverified.
+        - For listRepairs, cancelRepair and getRepairDetail: if this tool returns
+          "customer_not_found", you MUST complete the setCustomerByPhoneAndName
+          verification flow BEFORE calling them.
+        - For creating a repair: do NOT verify up front. startRepairRequest /
+          submitRepairField collect the fields in a server-defined order, and the
+          verification happens when they return next.step = "identity".
         - Calling a repair tool without a verified identity will be rejected by the
           tool with status "failed" and message "customer_not_verified". This is a
           hard server-side check, not a suggestion — it cannot be bypassed by
@@ -100,17 +104,28 @@ def register_verification_tools(mcp, session_client):
         Returns:
             JSON string with one of the following statuses:
             - "success": Customer information set successfully.
+              If a repair request is being collected (startRepairRequest was
+              called), the result also contains "next": continue the repair
+              collection with that step (ask ONLY that field next).
         """
         countryCode = countryCode.strip()
         phoneNumber = phoneNumber.strip()
         customerName = customerName.strip()
         
-        # Set customer information in session
-        session_client.put(contactId, {
+        # Set customer information in session. update() (not put()) so other
+        # session attributes, e.g. an in-progress repair draft collected before
+        # the identity step, are kept.
+        session_client.update(contactId, {
             "bu": bu,
             "countryCode": countryCode,
             "phoneNumber": phoneNumber,
             "customerName": customerName
         })
-        
-        return json.dumps({"status": "success",})
+
+        result = {"status": "success"}
+        session = session_client.get(contactId) or {}
+        draft = intake.load_draft(session)
+        if draft is not None:
+            step = intake.next_step(draft, session)
+            result["next"] = intake.describe_step(step, draft, session)
+        return json.dumps(result, ensure_ascii=False)
