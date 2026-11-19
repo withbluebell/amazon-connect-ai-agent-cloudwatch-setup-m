@@ -6,15 +6,10 @@ This module provides repair service management functionality.
 import json
 import logging
 from util import call_iservice
+from . import repair_intake as intake
+from .repair_intake import REQUIRED_IDENTITY_FIELDS as _REQUIRED_IDENTITY_FIELDS
 
 log = logging.getLogger("mcp_server")
-
-# Identity fields that MUST be present in the session before any repair
-# operation can call the downstream iService API. These are written ONLY by
-# setCustomerByPhoneAndName; if any is missing the customer has not completed
-# identity verification and the request must be rejected rather than sent
-# downstream with null values (which produces orphaned/dirty records).
-_REQUIRED_IDENTITY_FIELDS = ("bu", "countryCode", "phoneNumber", "customerName")
 
 
 def _get_verified_session(session_client, contactId):
@@ -55,27 +50,24 @@ def register_repair_tools(mcp, session_client):
         session_client: session store client
     """
 
+    # Fail fast at startup if REPAIR_FIELD_ORDER is misconfigured.
+    step_order = intake.get_step_order()
+    log.info(f"repair intake order: {list(step_order)}")
+
+    def _next_response(status, draft, session, **extra):
+        step = intake.next_step(draft, session)
+        body = {"status": status, **extra, "next": intake.describe_step(step, draft, session)}
+        return json.dumps(body, ensure_ascii=False)
+
     @mcp.tool(structured_output=False)
-    async def createRepair(
-        contactId: str,
-        addressRemark: str,
-        description: str,
-        zipCode: str,
-        email: str,
-        srType: str,
-        srSubType: str,
-        productModel: str = "",
-        serialNumber: str = "",
-        productCategory: str = "",
-        brand: str = "",
-    ) -> str:
-        """Create a repair service request.
+    async def startRepairRequest(contactId: str) -> str:
+        """Start collecting the information for a new repair service request.
 
         ═══════════════════════════════════════════════════════════════════════════════════
         INVOCATION TRIGGER (CRITICAL)
         ═══════════════════════════════════════════════════════════════════════════════════
 
-        ONLY initiate this tool (field collection, confirmation summary, and tool call) when the customer EXPLICITLY requests to create a repair order. Do NOT offer, suggest, or proactively propose creating a repair order.
+        ONLY call this tool when the customer EXPLICITLY requests to create a repair order. Do NOT offer, suggest, or proactively propose creating a repair order.
 
         Examples of explicit requests:
         - "I need to create a repair order"
@@ -90,144 +82,178 @@ def register_repair_tools(mcp, session_client):
 
         NEVER bridge from "I couldn't find an answer" to "would you like to create a repair order?". Only the customer may open that door, with an explicit request.
 
-        If the customer is only asking questions or gathering information, respond to their questions (e.g., via FAQ search, order status queries) without initiating createRepair.
-
         ═══════════════════════════════════════════════════════════════════════════════════
-        PREREQUISITE (MANDATORY IDENTITY GATE)
+        SERVER-CONTROLLED COLLECTION ORDER (CRITICAL)
         ═══════════════════════════════════════════════════════════════════════════════════
 
-        A verified customer identity is REQUIRED before this tool will do anything.
-        Identity is verified ONLY after setCustomerByPhoneAndName has completed
-        successfully in this session.
+        The collection order is decided by the server, NOT by you. Do NOT plan your own order, and do NOT ask for any field before the server tells you to.
 
-        You MUST, in this exact order, BEFORE collecting any repair fields:
-        1. Call checkCustomer.
-        2. If checkCustomer returns "customer_not_found", complete the
-           setCustomerByPhoneAndName verification flow and do NOT proceed until it
-           returns "success".
-        3. Only then begin field collection and ultimately call createRepair.
+        This tool starts a fresh draft (any previous unfinished draft in this contact is discarded) and returns "next": the ONLY thing you may ask the customer now.
 
-        Never skip step 2. If the conversation was interrupted (e.g. the customer
-        changed topic or barged in) and you are unsure whether verification
-        completed, call checkCustomer again and re-verify rather than assuming.
+        Loop:
+        1. Read "next.step" and "next.instruction" from the latest tool result.
+        2. If next.step is a field name: ask the customer for THAT field only, ONE question in ONE <message>, then STOP and wait for the answer.
+        3. Submit the answer with submitRepairField(field=next.step, ...). Its result contains the new "next".
+        4. If next.step is "identity": verify phone number and name with checkCustomer / setCustomerByPhoneAndName. The setCustomerByPhoneAndName result contains the new "next".
+        5. If next.step is "confirm": follow the createRepair CONFIRMATION PROTOCOL using next.summary.
 
-        This is enforced server-side: if identity is not verified, createRepair
-        returns status "failed" with message "customer_not_verified" and performs
-        no action. Supplying field values directly does NOT satisfy the gate.
+        If you are unsure where you are (for example after an interruption or topic change), call getRepairNextStep instead of guessing.
+
+        Args:
+            contactId: The current contact ID from system-variables ({{$.contactId}}).
+
+        Returns:
+            JSON: {"status": "started", "next": {...}}
+        """
+        log.info(f"startRepairRequest: contactId='{contactId}'")
+        draft = intake.new_draft()
+        session_client.update(contactId, {intake.DRAFT_KEY: draft})
+        session = session_client.get(contactId) or {}
+        return _next_response("started", draft, session)
+
+    @mcp.tool(structured_output=False)
+    async def submitRepairField(
+        contactId: str, field: str, value: str = "", skipped: bool = False
+    ) -> str:
+        """Submit the customer's answer for the CURRENT repair field.
+
+        INTERNAL TOOL - Do NOT mention this tool to the customer.
+
+        Rules:
+        - field MUST equal "next.step" from the latest startRepairRequest / submitRepairField / getRepairNextStep / setCustomerByPhoneAndName result. Any other field is rejected with status "wrong_field" and nothing is saved.
+        - Submit exactly what the customer said for that field. Normalize spoken formats before submitting (for example "john dot smith at example dot com" -> "john.smith@example.com").
+        - If the customer already mentioned this value earlier in the conversation, you may confirm it with the customer ("You mentioned a refrigerator, correct?") instead of asking from scratch, then submit it when the server asks for this field.
+        - OPTIONAL field and the customer does not know / wants to skip: call with skipped=true. Do NOT re-ask it.
+        - REQUIRED field and the customer cannot provide a valid value: submit what they said (or skipped=true). The server counts failed attempts.
+
+        Args:
+            contactId: The current contact ID from system-variables ({{$.contactId}}).
+            field: The field name from next.step.
+            value: The customer's answer for that field.
+            skipped: true if the customer does not know / does not want to provide it.
+
+        Returns:
+            JSON with "status" and, except for "escalate", a "next" object:
+            - "accepted": Value saved. Continue with "next".
+            - "invalid": Value rejected (see "reason"). Ask for the SAME field again; "attemptsLeft" shows how many failed attempts remain for REQUIRED fields.
+            - "escalate": REQUIRED fields failed 3 times in total. Stop collecting and transfer to a human agent (see escalation-rules).
+            - "wrong_field": You submitted a field out of order. Nothing saved. Ask for next.step instead.
+            - "identity_required": Phone number / name verification must happen now (see next.instruction).
+            - "failed" with message "intake_not_started": call startRepairRequest first.
+        """
+        log.info(
+            f"submitRepairField: contactId='{contactId}', field='{field}', skipped={skipped}"
+        )
+        session = session_client.get(contactId) or {}
+        draft = intake.load_draft(session)
+        if draft is None:
+            return json.dumps({"status": "failed", "message": "intake_not_started"})
+
+        expected = intake.next_step(draft, session)
+        field = (field or "").strip()
+        value = (value or "").strip()
+
+        if expected == intake.STEP_IDENTITY:
+            return _next_response("identity_required", draft, session)
+        if expected == intake.STEP_CONFIRM:
+            return _next_response("all_fields_collected", draft, session)
+        if field != expected:
+            return _next_response("wrong_field", draft, session, submittedField=field)
+
+        spec = intake.FIELD_SPECS[field]
+        reason = None
+        if skipped or not value:
+            if spec["required"]:
+                reason = "required_field_missing"
+            else:
+                value = ""
+        elif spec.get("validate"):
+            reason = spec["validate"](value)
+
+        if reason:
+            draft["failures"] += 1
+            session_client.update(contactId, {intake.DRAFT_KEY: draft})
+            if draft["failures"] >= intake.MAX_REQUIRED_FAILURES:
+                log.info(f"submitRepairField escalate: contactId='{contactId}'")
+                return json.dumps({"status": "escalate", "reason": reason})
+            return _next_response(
+                "invalid",
+                draft,
+                session,
+                reason=reason,
+                attemptsLeft=intake.MAX_REQUIRED_FAILURES - draft["failures"],
+            )
+
+        draft["values"][field] = value
+        draft["completed"].append(field)
+        session_client.update(contactId, {intake.DRAFT_KEY: draft})
+        return _next_response("accepted", draft, session)
+
+    @mcp.tool(structured_output=False)
+    async def getRepairNextStep(contactId: str) -> str:
+        """Return the current step of an in-progress repair request (read-only).
+
+        INTERNAL TOOL - Do NOT mention this tool to the customer.
+
+        Call this when you are not sure which repair field to ask next, for example after an interruption, a barge-in, or a short topic change during repair collection. Never guess the next field.
+
+        Args:
+            contactId: The current contact ID from system-variables ({{$.contactId}}).
+
+        Returns:
+            JSON: {"status": "in_progress", "next": {...}} or
+            {"status": "failed", "message": "intake_not_started"}.
+        """
+        session = session_client.get(contactId) or {}
+        draft = intake.load_draft(session)
+        if draft is None:
+            return json.dumps({"status": "failed", "message": "intake_not_started"})
+        return _next_response("in_progress", draft, session)
+
+    @mcp.tool(structured_output=False)
+    async def createRepair(
+        contactId: str,
+        srType: str = "Inquiry",
+        srSubType: str = "Product",
+    ) -> str:
+        """Create the repair service request from the collected draft.
 
         ═══════════════════════════════════════════════════════════════════════════════════
-        FIELD COLLECTION FLOW
+        PREREQUISITE
         ═══════════════════════════════════════════════════════════════════════════════════
 
-        Fixed values (set automatically — do NOT ask the customer):
-        - srType = "Inquiry"
-        - srSubType = "Product"
-        - Customer name — retrieved automatically from verified session (do NOT ask the customer)
+        Do NOT collect repair fields yourself for this tool. All values (product category, model, brand, serial number, issue, email, service address, zip code, phone number, name) are collected step by step through startRepairRequest / submitRepairField, in the order the server dictates, and are read by this tool from the session. This tool takes no field values.
 
-        COLLECTION ORDER — ask ONE field per message, IN THIS EXACT ORDER (do NOT reorder):
-        1. Brand — OPTIONAL
-        2. Product category — OPTIONAL
-        3. Model — OPTIONAL
-        4. Serial number — OPTIONAL
-        5. Issue — REQUIRED
-        6. Service address — OPTIONAL
-        7. Zip code — REQUIRED
-        8. Email — REQUIRED
+        Only call this tool after:
+        1. The latest repair tool result returned next.step = "confirm", AND
+        2. You presented next.summary to the customer and received explicit confirmation.
 
-        Move to the confirmation phase only after every field above has been asked once, in order, and all REQUIRED fields hold valid values.
-
-        ═══════════════════════════════════════════════════════════════════════════════════
-        FIELD VALIDATION RULES
-        ═══════════════════════════════════════════════════════════════════════════════════
-
-        REQUIRED fields (Issue, Zip code, Email):
-        - Must be collected and hold valid values before the confirmation phase.
-        - If the customer has failed to provide valid values for REQUIRED fields a cumulative total of 3 times in this createRepair session (across any REQUIRED field), stop collecting and transfer to a human agent (see escalation-rules in prompt).
-
-        OPTIONAL fields (Brand, Product category, Model, Serial number, Service address):
-        - Ask each one, but do NOT require an answer — the customer may not know.
-        - If the customer says they don't know, don't have it, or wants to skip, accept it, leave the field blank, and move to the next field.
-        - Do NOT re-ask a skipped OPTIONAL field.
-        - Do NOT count skipping an OPTIONAL field toward escalation.
+        If called too early, it returns status "failed" with message "intake_not_completed" and a "next" object. Continue with that "next" step.
 
         ═══════════════════════════════════════════════════════════════════════════════════
         CONFIRMATION PROTOCOL
         ═══════════════════════════════════════════════════════════════════════════════════
 
-        This tool requires user confirmation. After collecting ALL fields (both REQUIRED and OPTIONAL), present a complete summary of every field to the customer in a single <message></message>. The summary must list every field and its value, then ask the customer to confirm. Only call the tool after receiving explicit confirmation.
+        This tool requires user confirmation. When next.step is "confirm", present EVERY item of next.summary (label: value), in the given order, in a single <message></message>, then ask the customer to confirm. Only call the tool after receiving explicit confirmation.
 
         The confirmation summary is presented EXACTLY ONCE. There are two and only two outcomes:
         - Customer says "Yes" or equivalent approval: Proceed immediately with the tool call. Do NOT ask for confirmation again.
         - Customer says "No", indicates something is wrong, or wants to change anything: Tell the customer you cannot modify the details here in this conversation and transfer to a human agent to help with modifications.
 
         ═══════════════════════════════════════════════════════════════════════════════════
-        PARAMETER MAPPING (Prompt → Tool)
+        PARAMETERS
         ═══════════════════════════════════════════════════════════════════════════════════
 
-        USER-PROVIDED INPUTS (from customer via Prompt):
-            brand (str, optional)
-                Mapping: Brand (field #1)
-                Customer-provided product brand.
-
-            productCategory (str, optional)
-                Mapping: Product category (field #2)
-                Customer-provided main product category (e.g., Refrigerator, Air Conditioner).
-
-            productModel (str, optional)
-                Mapping: Model (field #3)
-                Customer-provided product model number.
-
-            serialNumber (str, optional)
-                Mapping: Serial number (field #4)
-                Customer-provided product serial number.
-
-            description (str, required)
-                Mapping: Issue (field #5)
-                Customer-provided problem description.
-
-            addressRemark (str, optional)
-                Mapping: Service address (field #6)
-                Customer-provided service address as raw text.
-
-            zipCode (str, required)
-                Mapping: Zip code (field #7)
-                Customer-provided postal/zip code of service address.
-
-            email (str, required)
-                Mapping: Email (field #8)
-                Customer-provided email address.
-
-        AUTO-POPULATED FROM SESSION (NOT collected from customer):
             contactId (str, required)
                 Source: system-variables ({{$.contactId}})
-                Used to look up verified customer information in session.
 
-            srType (str, fixed)
-                Fixed value: "Inquiry" (set automatically by Prompt, do NOT ask customer)
-                Tool will use provided value or default to "Inquiry" if empty.
-
-            srSubType (str, fixed)
-                Fixed value: "Product" (set automatically by Prompt, do NOT ask customer)
-                Tool will use provided value or default to "Product" if empty.
-
-            countryCode (NOT a parameter)
-                Source: Retrieved from session using contactId
-                Used when calling API, not exposed as function parameter.
-
-            phoneNumber (NOT a parameter)
-                Source: Retrieved from session using contactId
-                Used when calling API, not exposed as function parameter.
-
-            customerName (NOT a parameter)
-                Source: Retrieved automatically from verified session using contactId
-                NOTE: Customer name is NOT collected from user — Prompt never asks for it.
-                It is always taken from verified session data to ensure consistency.
-                Used when calling API, not exposed as function parameter.
+            srType (str, fixed) - always "Inquiry". Do NOT ask the customer.
+            srSubType (str, fixed) - always "Product". Do NOT ask the customer.
 
         Returns:
             JSON string with one of the following statuses:
             - "success": Repair request created successfully, includes srNumber (the service request number assigned to this order)
-            - "failed": Creation failed, includes reason for failure. In particular, message "customer_not_verified" means the mandatory identity gate was not satisfied — go back and complete checkCustomer + setCustomerByPhoneAndName, then retry.
+            - "failed": Creation failed. Message "intake_not_completed" means collection is not finished (continue with "next"). Message "customer_not_verified" means the identity step is not done.
 
         POST-CALL: After a SUCCESSFUL tool call, append the questionFinish placeholder ({{$.Custom.questionFinish}}) at the end of your customer-facing message, separated by one blank line. Do NOT append it if the call failed or returned an error. Appending the questionFinish placeholder counts as your single question for that turn.
         """
@@ -237,14 +263,15 @@ def register_repair_tools(mcp, session_client):
         if err:
             return err
 
-        productCategory = productCategory.strip() if productCategory else ""
-        productModel = productModel.strip() if productModel else ""
-        serialNumber = serialNumber.strip() if serialNumber else ""
-        brand = brand.strip() if brand else ""
-        addressRemark = addressRemark.strip()
-        description = description.strip()
-        zipCode = zipCode.strip()
-        email = email.strip()
+        draft = intake.load_draft(session)
+        if draft is None:
+            return json.dumps({"status": "failed", "message": "intake_not_started"})
+        if intake.next_step(draft, session) != intake.STEP_CONFIRM:
+            return _next_response("failed", draft, session, message="intake_not_completed")
+
+        values = draft["values"]
+        productCategory = values.get("productCategory", "")
+        description = values.get("description", "")
         srType = srType.strip() if srType else "Inquiry"
         srSubType = srSubType.strip() if srSubType else "Product"
 
@@ -262,13 +289,13 @@ def register_repair_tools(mcp, session_client):
                 "customerName": session.get("customerName"),
                 "srType": srType,
                 "srSubType": srSubType,
-                "productModel": productModel,
-                "serialNumber": serialNumber,
-                "brand": brand,
-                "addressRemark": addressRemark,
+                "productModel": values.get("productModel", ""),
+                "serialNumber": values.get("serialNumber", ""),
+                "brand": values.get("brand", ""),
+                "addressRemark": values.get("addressRemark", ""),
                 "description": formatted_description,
-                "zipCode": zipCode,
-                "email": email,
+                "zipCode": values.get("zipCode", ""),
+                "email": values.get("email", ""),
                 "contactId": contactId,
                 "status": "Draft",
             },
@@ -279,6 +306,9 @@ def register_repair_tools(mcp, session_client):
             api_data = api_result.get("data", {})
             if api_data.get("success"):
                 sr_number = api_data.get("srNumber", "Unknown")
+                # Clear the draft so a second repair in this contact starts fresh
+                # and a repeated createRepair call cannot create a duplicate.
+                session_client.remove_keys(contactId, [intake.DRAFT_KEY])
                 return json.dumps(
                     {
                         "status": "success",
@@ -289,7 +319,7 @@ def register_repair_tools(mcp, session_client):
             else:
                 error_msg = api_data.get("message", "Unknown error")
         else:
-            error_msg = {api_result.get("resultMsg", "Unknown error")}
+            error_msg = api_result.get("resultMsg", "Unknown error")
 
         log.info(f"createRepair error: {error_msg}")
         return json.dumps(
